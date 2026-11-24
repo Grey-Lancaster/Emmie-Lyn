@@ -7,9 +7,11 @@
 // PSRAM, so one big contiguous sprite for the whole screen isn't an option).
 #include <Arduino.h>
 #include <TFT_eSPI.h>
+#include <Preferences.h>
+#include <driver/i2s.h>
 #include <math.h>
 
-#define AMP_EN 4  // speaker amp enable, active LOW; held HIGH (off) here
+#define AMP_EN 4  // speaker amp enable, active LOW; now held LOW (on) for firework sound effects
 
 static inline uint16_t rgb(int r, int g, int b) {
   r = constrain(r, 0, 255); g = constrain(g, 0, 255); b = constrain(b, 0, 255);
@@ -286,6 +288,228 @@ static void drawShip(float t) {
     band.fillRect((int)(shipX - 60 + i * 20), BY(hullY - 7), 4, 4, rgb(235, 190, 110));
 }
 
+// ---------------------------------------------------------------- firework sound effects
+// Real audio through the ESP32's internal DAC via I2S (same technique as Grey's Fish Tank/
+// Deer Hunt boards): a dedicated task on core 1 plays back Grey's own recorded fireworks
+// clip - a short single-pop snippet for each individual burst, the longer full clip for the
+// grand synchronized salvo - scaling it by the chosen volume as real digital gain (not a PWM
+// duty-cycle trick, which doesn't audibly change loudness on this amp), then dithering it
+// down to the DAC's 8 bits the same way Fish Tank does. Only the volume-preview beep is
+// still synthesized, since it's a UI sound rather than a firework sound.
+static int fwPrevPhase[NUM_FW] = { 0 };
+
+// Grey's recorded fireworks clip (trimmed, resampled to 16 kHz mono), embedded in flash:
+// a short single-pop snippet for ordinary bursts, and the longer full clip for the salvo.
+extern const uint8_t burst_start[] asm("_binary_src_burst_raw_start");
+extern const uint8_t burst_end[] asm("_binary_src_burst_raw_end");
+extern const uint8_t fireworks_start[] asm("_binary_src_fireworks_raw_start");
+extern const uint8_t fireworks_end[] asm("_binary_src_fireworks_raw_end");
+static const float FIREWORKS_SR = 16000.0f;
+
+static volatile bool g_soundOn = true;
+static volatile int g_volumeLevel = 3;  // 0..4
+static const float VOLUME_GAIN[5] = { 0.10f, 0.22f, 0.40f, 0.62f, 0.90f };
+static volatile int g_soundKind = 0;        // 0 none, 2 burst snippet, 3 preview beep, 4 full recorded clip
+static volatile uint32_t g_triggerSeq = 0;  // bumped on every new trigger, even if kind repeats
+
+static void loadSoundSettings() {
+  Preferences p;
+  p.begin("sound", true);
+  g_soundOn = p.getBool("on", true);
+  g_volumeLevel = p.getInt("vol", 3);
+  p.end();
+}
+static void saveSoundSettings() {
+  Preferences p;
+  p.begin("sound", false);
+  p.putBool("on", g_soundOn);
+  p.putInt("vol", g_volumeLevel);
+  p.end();
+}
+
+static void triggerSound(int kind) {
+  g_soundKind = kind;
+  g_triggerSeq++;
+}
+
+static void audioTask(void *) {
+  const float SR = 44100.0f;
+  static uint16_t out[256 * 2];
+  uint32_t localSeq = 0;
+  int localKind = 0;
+  uint32_t samplePos = 0;
+  float phase = 0;
+  int32_t err = 0;
+
+  for (;;) {
+    for (int i = 0; i < 256; i++) {
+      if (g_triggerSeq != localSeq) { localSeq = g_triggerSeq; localKind = g_soundKind; samplePos = 0; phase = 0; }
+      float elapsed = samplePos / SR;
+      float sampleF = 0;
+
+      if (localKind == 2) {  // a single recorded pop, for each ordinary burst
+        static const int32_t burstLen = (int32_t)((burst_end - burst_start) / 2);
+        float srcPosF = samplePos * (FIREWORKS_SR / SR);
+        int32_t i0 = (int32_t)srcPosF;
+        if (i0 < burstLen - 1) {
+          const int16_t *pcm = (const int16_t *)burst_start;
+          float frac = srcPosF - i0;
+          float s0 = pcm[i0] / 32768.0f, s1 = pcm[i0 + 1] / 32768.0f;
+          sampleF = s0 + (s1 - s0) * frac;
+        } else localKind = 0;
+
+      } else if (localKind == 3) {  // short fixed-pitch volume-preview beep
+        const float dur = 0.18f;
+        if (elapsed < dur) {
+          phase += 700.0f / SR; if (phase >= 1.0f) phase -= 1.0f;
+          float env = fminf(1.0f, elapsed / 0.01f) * fminf(1.0f, (dur - elapsed) / 0.03f);
+          sampleF = sinf(6.2831853f * phase) * env;
+        } else localKind = 0;
+      } else if (localKind == 4) {  // the real recorded fireworks clip, resampled up from 16 kHz
+        static const int32_t fwLen = (int32_t)((fireworks_end - fireworks_start) / 2);
+        float srcPosF = samplePos * (FIREWORKS_SR / SR);
+        int32_t i0 = (int32_t)srcPosF;
+        if (i0 < fwLen - 1) {
+          const int16_t *pcm = (const int16_t *)fireworks_start;
+          float frac = srcPosF - i0;
+          float s0 = pcm[i0] / 32768.0f, s1 = pcm[i0 + 1] / 32768.0f;
+          sampleF = s0 + (s1 - s0) * frac;
+        } else localKind = 0;
+      }
+      if (localKind != 0) samplePos++;
+      if (!g_soundOn) sampleF = 0;
+      else sampleF *= VOLUME_GAIN[g_volumeLevel];
+
+      int32_t m = (int32_t)(sampleF * 26000.0f);
+      if (m > 32767) m = 32767; else if (m < -32768) m = -32768;
+      // Dither down to the DAC's 8 bits with error feedback, exactly as Fish Tank does, so the
+      // rounding noise moves to high frequencies instead of a hiss across the whole range.
+      int32_t acc = m + err;
+      int32_t q = (acc + 128) >> 8;
+      if (q > 127) q = 127; else if (q < -128) q = -128;
+      err = acc - (q << 8);
+      if (err > 512) err = 512; else if (err < -512) err = -512;
+      const uint16_t v = (uint16_t)((q + 128) << 8);  // DAC wants offset-binary in the high byte
+      out[2 * i] = v; out[2 * i + 1] = v;
+    }
+    size_t written;
+    i2s_write(I2S_NUM_0, out, sizeof(out), &written, portMAX_DELAY);
+  }
+}
+
+static void startAudio() {
+  i2s_config_t cfg = {};
+  cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN);
+  cfg.sample_rate = 44100;
+  cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+  cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  cfg.communication_format = (i2s_comm_format_t)I2S_COMM_FORMAT_STAND_MSB;
+  cfg.intr_alloc_flags = 0;
+  cfg.dma_buf_count = 16;
+  cfg.dma_buf_len = 256;
+  cfg.use_apll = false;
+  cfg.tx_desc_auto_clear = true;
+  if (i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL) != ESP_OK) {
+    Serial.println("I2S install failed");
+    return;
+  }
+  i2s_set_dac_mode(I2S_DAC_CHANNEL_BOTH_EN);  // cyd40: both DAC pins free (touch is on the display bus)
+  xTaskCreatePinnedToCore(audioTask, "fwaudio", 4096, NULL, 2, NULL, 1);
+}
+
+static void previewVolume() { triggerSound(3); }
+
+static bool wasMega = false;
+
+static void updateFireworkSounds(float t) {
+  float masterT = fmodf(t, MEGA_PERIOD);
+  bool mega = masterT < (RISE_DUR + BURST_DUR);
+  if (mega && !wasMega) triggerSound(4);  // the recorded fireworks clip, once per grand salvo
+  wasMega = mega;
+  for (int i = 0; i < NUM_FW; i++) {
+    float localT = mega ? masterT : fmodf(t + FW[i].phase, FW[i].period);
+    int phase = (localT < RISE_DUR) ? 1 : ((localT < RISE_DUR + BURST_DUR) ? 2 : 0);
+    if (phase != fwPrevPhase[i]) {
+      // during the mega salvo the recorded clip plays instead; otherwise each burst gets a
+      // single recorded pop (no sound on the silent rise up)
+      if (!mega && phase == 2) triggerSound(2);
+      fwPrevPhase[i] = phase;
+    }
+  }
+}
+
+// ---------------------------------------------------------------- touch + settings dialog
+static bool dialogOpen = false;
+static bool wasTouched = false;
+static const int DLG_W = 300, DLG_H = 180;
+static const int DLG_X = (480 - DLG_W) / 2, DLG_Y = (320 - DLG_H) / 2;
+
+static inline bool inRect(int px, int py, int x, int y, int w, int h) {
+  return px >= x && px <= x + w && py >= y && py <= y + h;
+}
+
+static void drawDialog() {
+  uint16_t panel = rgb(20, 24, 45), toggleOn = rgb(60, 160, 90), toggleOff = rgb(160, 60, 60), btn = rgb(70, 70, 92);
+  tft.fillRoundRect(DLG_X, DLG_Y, DLG_W, DLG_H, 10, panel);
+  tft.drawRoundRect(DLG_X, DLG_Y, DLG_W, DLG_H, 10, TFT_WHITE);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, panel);
+  tft.drawString("Sound Settings", DLG_X + DLG_W / 2, DLG_Y + 20, 2);
+  tft.drawLine(DLG_X + DLG_W - 28, DLG_Y + 10, DLG_X + DLG_W - 12, DLG_Y + 26, TFT_WHITE);
+  tft.drawLine(DLG_X + DLG_W - 12, DLG_Y + 10, DLG_X + DLG_W - 28, DLG_Y + 26, TFT_WHITE);
+
+  tft.fillRoundRect(DLG_X + 20, DLG_Y + 44, DLG_W - 40, 42, 8, g_soundOn ? toggleOn : toggleOff);
+  tft.drawString(g_soundOn ? "Sound: ON" : "Sound: OFF", DLG_X + DLG_W / 2, DLG_Y + 65, 2);
+
+  tft.drawString("Volume", DLG_X + DLG_W / 2, DLG_Y + 104, 1);
+  tft.fillRoundRect(DLG_X + 20, DLG_Y + 116, 48, 42, 8, btn);
+  tft.drawString("-", DLG_X + 44, DLG_Y + 137, 4);
+  tft.fillRoundRect(DLG_X + DLG_W - 68, DLG_Y + 116, 48, 42, 8, btn);
+  tft.drawString("+", DLG_X + DLG_W - 44, DLG_Y + 137, 4);
+  for (int i = 0; i < 5; i++) {
+    int bx = DLG_X + 82 + i * 26;
+    tft.fillRoundRect(bx, DLG_Y + 126, 20, 22, 4, (i <= g_volumeLevel) ? rgb(240, 200, 80) : rgb(55, 55, 70));
+  }
+  tft.setTextDatum(TL_DATUM);
+}
+
+static void updateTouch(float t) {
+  uint16_t tx, ty;
+  bool touched = tft.getTouch(&tx, &ty, 350);  // a lighter threshold than the TFT_eSPI default (600)
+  bool newTap = touched && !wasTouched;
+  wasTouched = touched;
+  if (!newTap) return;
+  Serial.printf("tap at (%u,%u) dialogOpen=%d\n", tx, ty, dialogOpen);
+
+  if (!dialogOpen) {
+    dialogOpen = true;
+    return;
+  }
+  if (!inRect(tx, ty, DLG_X, DLG_Y, DLG_W, DLG_H)) { Serial.println("  -> outside dialog, closing"); dialogOpen = false; return; }
+  if (inRect(tx, ty, DLG_X + DLG_W - 30, DLG_Y + 8, 20, 20)) { Serial.println("  -> close button"); dialogOpen = false; return; }
+  if (inRect(tx, ty, DLG_X + 20, DLG_Y + 44, DLG_W - 40, 42)) {
+    Serial.println("  -> sound toggle");
+    g_soundOn = !g_soundOn;
+    saveSoundSettings();
+    return;
+  }
+  if (inRect(tx, ty, DLG_X + 20, DLG_Y + 116, 48, 42)) {
+    if (g_volumeLevel > 0) g_volumeLevel--;
+    Serial.printf("  -> volume - (now %d)\n", g_volumeLevel);
+    previewVolume();
+    saveSoundSettings();
+    return;
+  }
+  if (inRect(tx, ty, DLG_X + DLG_W - 68, DLG_Y + 116, 48, 42)) {
+    if (g_volumeLevel < 4) g_volumeLevel++;
+    Serial.printf("  -> volume + (now %d)\n", g_volumeLevel);
+    previewVolume();
+    saveSoundSettings();
+    return;
+  }
+  Serial.println("  -> inside dialog, no button hit");
+}
+
 static void drawScene() {
   float t = millis() / 1000.0f;
   for (int strip = 0; strip < NUM_STRIPS; strip++) {
@@ -305,11 +529,34 @@ void setup() {
   Serial.begin(115200);
   randomSeed(esp_random());
   pinMode(AMP_EN, OUTPUT);
-  digitalWrite(AMP_EN, HIGH);
+  digitalWrite(AMP_EN, LOW);  // enable the speaker amp (active LOW)
 
   tft.init();
   tft.setRotation(1);  // landscape, 480x320
   tft.fillScreen(TFT_BLACK);
+
+  // touch calibration: reuse it from flash if we have it, otherwise run the interactive
+  // 3-point calibration once (tap each crosshair) and save it for next time
+  uint16_t calData[5];
+  Preferences calPrefs;
+  calPrefs.begin("touchcal", true);
+  size_t calN = calPrefs.getBytes("cal5", calData, sizeof(calData));
+  calPrefs.end();
+  if (calN == sizeof(calData)) {
+    tft.setTouch(calData);
+  } else {
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("Tap each X to set up touch", 240, 20, 2);
+    tft.setTextDatum(TL_DATUM);
+    tft.calibrateTouch(calData, TFT_WHITE, TFT_RED, 15);
+    Preferences calPrefs2;
+    calPrefs2.begin("touchcal", false);
+    calPrefs2.putBytes("cal5", calData, sizeof(calData));
+    calPrefs2.end();
+  }
+  loadSoundSettings();
+  startAudio();
 
   initFireworks();
 
@@ -326,6 +573,12 @@ void loop() {
   static unsigned long lastFrame = 0;
   if (now - lastFrame >= 50) {  // ~20 fps
     lastFrame = now;
-    drawScene();
+    updateTouch(now / 1000.0f);
+    updateFireworkSounds(now / 1000.0f);
+    if (dialogOpen) {
+      drawDialog();  // frozen behind the dialog, so it isn't repainted over every frame
+    } else {
+      drawScene();
+    }
   }
 }
